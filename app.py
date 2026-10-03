@@ -15,7 +15,7 @@ from collections import Counter
 # ============================================================
 
 st.set_page_config(
-    page_title="AI Study Planner Pro",
+    page_title="AI Study Planner",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -187,7 +187,7 @@ h1,h2,h3,h4 { color:#263D78 !important; }
 """, unsafe_allow_html=True)
 
 st.markdown(
-    '<div class="main-title">📚 AI Study Planner Pro</div>',
+    '<div class="main-title">📚 AI Study Planner</div>',
     unsafe_allow_html=True
 )
 st.markdown(
@@ -887,7 +887,6 @@ def duration_text(minutes):
 # ============================================================
 
 def generate_plan():
-
     errors = validate_inputs()
 
     if errors:
@@ -900,132 +899,147 @@ def generate_plan():
             "No selected study day is available before the exam date."
         ]
 
-    # HARD TIME CONSTRAINT: use exactly the user's entered start/end window.
+    # --------------------------------------------------------
+    # HARD DAILY TIME CONSTRAINT
+    # --------------------------------------------------------
     daily_minutes = int(end_minutes - start_minutes)
-    total_minutes = daily_minutes * len(dates)
 
-    # HARD RULE: 100% SUBJECT COVERAGE
-    minimum_required = len(subjects) * 15
+    # We use 15-minute units internally so that every session is
+    # practical and the complete daily window is respected.
+    daily_slots = daily_minutes // 15
 
-    if minimum_required > total_minutes:
+    # Every subject must appear EVERY selected study day.
+    # Prefer a minimum 30-minute continuous session when possible.
+    preferred_min_slots = 2  # 30 minutes
+
+    if daily_slots < len(subjects):
+        minimum_daily_minutes = len(subjects) * 15
         return None, [
-            f"100% coverage needs at least "
-            f"{minimum_required} minutes. "
-            f"Available time is {total_minutes} minutes. "
-            f"Increase study hours or study days."
+            f"Every subject must be covered every study day. "
+            f"{len(subjects)} subjects need at least "
+            f"{minimum_daily_minutes} minutes per day "
+            f"(15 minutes per subject), but the entered daily window "
+            f"has only {daily_minutes} minutes. "
+            f"Increase the daily study time or reduce the number of subjects."
         ]
 
     # --------------------------------------------------------
-    # Dynamic AI weights
+    # AI IMPORTANCE / PRIORITY WEIGHTS
     # --------------------------------------------------------
-
     weights = {
         subject: importance_score(subject)
         for subject in subjects
     }
 
-    total_weight = sum(weights.values())
-
-    target_minutes = {}
-
-    for subject in subjects:
-        extra = (
-            (total_minutes - minimum_required)
-            * weights[subject]
-            / total_weight
-        )
-
-        target_minutes[subject] = (
-            15 + int(extra)
-        )
-
-    # Correct rounding
-    difference = (
-        total_minutes
-        - sum(target_minutes.values())
-    )
-
-    ranked_subjects = sorted(
-        subjects,
-        key=lambda x: weights[x],
-        reverse=True
-    )
-
-    index = 0
-
-    while difference >= 15:
-        target_minutes[
-            ranked_subjects[index % len(ranked_subjects)]
-        ] += 15
-
-        difference -= 15
-        index += 1
-
     # --------------------------------------------------------
-    # Dynamic timetable
+    # CONTINUOUS SESSION ALLOCATION
+    #
+    # Desired session sizes:
+    #   30 / 45 / 60 / 75 minutes
+    #
+    # Every subject appears once per day.
+    # Higher-weight subjects receive the larger sessions first.
+    #
+    # If the daily window is too small to give everyone 30 min,
+    # the algorithm safely falls back to 15-min minimums.
     # --------------------------------------------------------
+    if daily_slots >= len(subjects) * preferred_min_slots:
+        minimum_slots = preferred_min_slots
+    else:
+        minimum_slots = 1  # 15-minute safe fallback
 
-    remaining = target_minutes.copy()
-    task_index = {
-        subject: 0
+    daily_base_slots = len(subjects) * minimum_slots
+    extra_slots = daily_slots - daily_base_slots
+
+    # Maximum continuous session = 75 minutes = 5 slots.
+    max_slots_per_subject = 5
+
+    daily_slot_counts = {
+        subject: minimum_slots
         for subject in subjects
     }
 
+    # Give extra 15-minute blocks to the most important subjects.
+    # A subject can grow:
+    # 30 -> 45 -> 60 -> 75 minutes.
+    #
+    # The selection formula considers both AI importance and the
+    # amount already assigned, preventing all spare time from going
+    # to one subject.
+    while extra_slots > 0:
+        eligible = [
+            subject
+            for subject in subjects
+            if daily_slot_counts[subject] < max_slots_per_subject
+        ]
+
+        if not eligible:
+            break
+
+        selected = max(
+            eligible,
+            key=lambda subject: (
+                weights[subject] / daily_slot_counts[subject],
+                weights[subject]
+            )
+        )
+
+        daily_slot_counts[selected] += 1
+        extra_slots -= 1
+
     rows = []
 
+    # --------------------------------------------------------
+    # CREATE EACH DAY
+    # --------------------------------------------------------
     for current_date in dates:
 
-        available = daily_minutes
+        # Higher-priority subjects are placed earlier in the day,
+        # but every subject receives exactly one continuous block.
+        ordered_subjects = sorted(
+            subjects,
+            key=lambda subject: (
+                -weights[subject],
+                subjects.index(subject)
+            )
+        )
+
         current_time = start_minutes
 
-        while (
-            available >= 15
-            and any(
-                value >= 15
-                for value in remaining.values()
-            )
-        ):
+        for subject in ordered_subjects:
+            session_minutes = daily_slot_counts[subject] * 15
 
-            active = [
-                subject
-                for subject in subjects
-                if remaining[subject] >= 15
-            ]
+            # Safety: never exceed the user-entered daily window.
+            if current_time + session_minutes > end_minutes:
+                return None, [
+                    "The generated continuous sessions exceed the "
+                    "entered daily time window."
+                ]
 
-            selected = max(
-                active,
-                key=lambda subject:
-                    weights[subject]
-                    * remaining[subject]
-                    / max(
-                        15,
-                        target_minutes[subject]
-                    )
-            )
-
-            session = min(
-                predicted_session_minutes(selected),
-                remaining[selected],
-                available
-            )
-
-            session = max(
-                15,
-                (int(session) // 15) * 15
-            )
-
-            session = min(
-                session,
-                remaining[selected],
-                available
-            )
-
-            if session < 15:
-                break
+            # Select a task based on the allocated session size.
+            # Larger blocks can cover more learning work.
+            if session_minutes >= 75:
+                task_text = (
+                    f"{subject} - Deep Learning / Advanced Practice"
+                )
+            elif session_minutes >= 60:
+                task_text = (
+                    f"{subject} - Concepts + Practice + Problems"
+                )
+            elif session_minutes >= 45:
+                task_text = (
+                    f"{subject} - Concepts + Practice"
+                )
+            elif session_minutes >= 30:
+                task_text = (
+                    f"{subject} - Concept Learning + Practice"
+                )
+            else:
+                task_text = get_task(subject, 0)
 
             start_display = clock_time(current_time)
             end_display = clock_time(
-                current_time + session
+                current_time + session_minutes
             )
 
             rows.append({
@@ -1037,92 +1051,30 @@ def generate_plan():
                 ),
                 "Start Time": start_display,
                 "End Time": end_display,
-                "Subject": selected,
-                "What to Study": get_task(
-                    selected,
-                    task_index[selected]
-                ),
-                "Duration": duration_text(session),
-                "Duration Minutes": session,
-                "Priority": priority_level(selected),
-                "Category": subject_category(selected),
+                "Subject": subject,
+                "What to Study": task_text,
+                "Duration": duration_text(session_minutes),
+                "Duration Minutes": session_minutes,
+                "Priority": priority_level(subject),
+                "Category": subject_category(subject),
                 "AI Reason": (
-                    f"Importance {weights[selected]:.1f} | "
-                    f"Exam urgency {(exam_urgency() if exam_urgency() is not None else 1.0):.1f}/5"
+                    f"AI Importance {weights[subject]:.1f} | "
+                    f"Priority {priority_level(subject)} | "
+                    f"Continuous daily session"
                 ),
                 "_date": current_date,
                 "_start": current_time
             })
 
-            remaining[selected] -= session
-            task_index[selected] += 1
-
-            current_time += session
-            available -= session
+            current_time += session_minutes
 
     # --------------------------------------------------------
-    # Coverage recovery
+    # REVISION / MOCK TEST
+    #
+    # Revision is added only if spare time remains AFTER all
+    # subjects have received their daily continuous sessions.
     # --------------------------------------------------------
-
-    scheduled_subjects = {
-        row["Subject"]
-        for row in rows
-    }
-
-    for subject in subjects:
-
-        if subject in scheduled_subjects:
-            continue
-
-        placed = False
-
-        for current_date in dates:
-
-            used = sum(
-                row["Duration Minutes"]
-                for row in rows
-                if row["_date"] == current_date
-            )
-
-            if used + 15 <= daily_minutes:
-
-                start = start_minutes + used
-
-                rows.append({
-                    "Date": current_date.strftime("%d %b %Y"),
-                    "Day": current_date.strftime("%A"),
-                    "Time": (
-                        f"{clock_time(start)} – "
-                        f"{clock_time(start + 15)}"
-                    ),
-                    "Start Time": clock_time(start),
-                    "End Time": clock_time(start + 15),
-                    "Subject": subject,
-                    "What to Study": get_task(subject, 0),
-                    "Duration": "15 min",
-                    "Duration Minutes": 15,
-                    "Priority": priority_level(subject),
-                    "Category": subject_category(subject),
-                    "AI Reason": "100% coverage recovery slot",
-                    "_date": current_date,
-                    "_start": start
-                })
-
-                placed = True
-                break
-
-        if not placed:
-            return None, [
-                "100% subject coverage is not possible "
-                "with the current time constraints."
-            ]
-
-    # --------------------------------------------------------
-    # Revision / Mock Test
-    # --------------------------------------------------------
-
     if revision_enabled and dates:
-
         last_date = dates[-1]
 
         used = sum(
@@ -1134,7 +1086,6 @@ def generate_plan():
         free = daily_minutes - used
 
         if free >= 30:
-
             revision_minutes = min(
                 45,
                 (free // 15) * 15
@@ -1157,21 +1108,21 @@ def generate_plan():
                 "What to Study": (
                     f"{goal} - Final Revision / Mock Test"
                 ),
-                "Duration": duration_text(
-                    revision_minutes
-                ),
+                "Duration": duration_text(revision_minutes),
                 "Duration Minutes": revision_minutes,
                 "Priority": "High",
                 "Category": "Revision",
-                "AI Reason": "Adaptive revision using spare time",
+                "AI Reason": (
+                    "Uses spare time after every subject "
+                    "has received its daily session"
+                ),
                 "_date": last_date,
                 "_start": start
             })
 
     # --------------------------------------------------------
-    # Final dataframe
+    # FINAL DATAFRAME
     # --------------------------------------------------------
-
     df = pd.DataFrame(rows)
 
     df = df.sort_values(
@@ -1346,39 +1297,6 @@ if generate_button or regenerate_button:
         st.success(
             "✅ AI/ML study plan generated successfully!"
         )
-
-
-# ============================================================
-# AI/ML ANALYSIS
-# ============================================================
-
-st.markdown(
-    '<div class="section">🧠 Adaptive AI/ML Analysis</div>',
-    unsafe_allow_html=True
-)
-
-render_metric_cards([
-    ("Learner Level", level, "🎓"),
-    ("Study Goal", goal, "🎯"),
-    ("Exam Urgency", f"{exam_urgency():.1f}/5" if exam_urgency() is not None else "Not set", "⚡"),
-    ("AI Workload", predict_workload(), "🧩")
-])
-
-st.markdown(
-    f"""
-    <div class="info">
-    <b>AI decision factors:</b>
-    learner level, study goal, available hours,
-    {len(subjects)} subjects, priority, weak subjects,
-    difficulty, exam countdown and study days.
-    <br><br>
-    <b>Hard rule:</b> Every entered subject must be included
-    in the timetable.
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
 
 # ============================================================
 # REQUIRED PROJECT CONCEPTS
@@ -1862,7 +1780,7 @@ for i, (icon, text) in enumerate(outcomes):
 st.markdown(
     """
     <div class="footer">
-    🌿 <b>AI Study Planner Pro</b> 🌿<br><br>
+    🌿 <b>AI Study Planner</b> 🌿<br><br>
     A simple, adaptive AI/ML study planner
     for learners from primary school to postgraduate level.
     </div>
